@@ -1,0 +1,181 @@
+###############################
+# Configuration for the project
+###############################
+
+[project]
+name = 'coords2sans'
+dynamic = ['version']  # Use versioningit to manage the version
+description = 'Small-angle neutron scattering curves I(q) from atom coordinates.'
+authors = [{ name = 'Ales Kutsepau' }]
+readme = 'README.md'
+classifiers = [
+  'Intended Audience :: Science/Research',
+  'Topic :: Scientific/Engineering',
+  'Operating System :: OS Independent',
+  'Programming Language :: Python :: 3 :: Only',
+  'Programming Language :: Python :: 3',
+  'Programming Language :: Python :: 3.11',
+  'Programming Language :: Python :: 3.12',
+  'Programming Language :: Python :: 3.13',
+]
+requires-python = '>=3.11'
+dependencies = [
+  'numpy>=2.0',  # Arrays and the scattering sums
+  'periodictable>=2.1',  # Neutron SLDs, element masses and densities
+]
+
+[project.optional-dependencies]
+plot = [
+  'matplotlib',  # Curve.plot
+]
+dev = [
+  'build',  # Building the package
+  'pytest',  # Testing
+  'pytest-cov',  # Test coverage
+  'ruff',  # Linting and formatting code
+  'pydoclint',  # Docstring linter
+  'validate-pyproject[all]',  # Validate pyproject.toml
+  'versioningit',  # Automatic versioning from git tags
+]
+
+[project.urls]
+'Source Code' = 'https://github.com/seventil/coords2sans'
+'Issue Tracker' = 'https://github.com/seventil/coords2sans/issues'
+
+############################
+# Build system configuration
+############################
+
+[build-system]
+build-backend = 'hatchling.build'
+requires = ['hatchling', 'versioningit']
+
+#############################
+# Configuration for hatchling
+#############################
+
+# 'hatch' -- Build system for Python
+# https://hatch.pypa.io/
+
+[tool.hatch.build.targets.wheel]
+packages = ['src/coords2sans']
+
+[tool.hatch.version]
+source = 'versioningit'  # Use versioningit to manage the version
+
+################################
+# Configuration for versioningit
+################################
+
+# 'versioningit' -- Versioning from git tags
+# https://versioningit.readthedocs.io/
+
+# Do not use {distance} in the version format, as it forces a version
+# bump for every commit, which triggers an unnecessary pixi.lock update
+# without any changes to the source code.
+
+[tool.versioningit.format]
+distance = '{base_version}+dev{distance}'  # example: 1.2.3.post4+dev3
+dirty = '{base_version}+dirty{distance}'  # example: 0.5.8+dirty3
+distance-dirty = '{base_version}+devdirty{distance}'  # example: 0.5.8+devdirty3
+
+# - 'match' ensures it only considers tags starting with 'v'
+# - 'default-tag' is used as a fallback when no matching tag is found
+[tool.versioningit.vcs]
+method = 'git'
+match = ['v*']
+default-tag = 'v0.0.0'
+
+#######################################
+# Configuration for coverage/pytest-cov
+#######################################
+
+# 'coverage' -- Code coverage measurement tool
+# https://coverage.readthedocs.io/en/latest/
+
+[tool.coverage.run]
+branch = true  # Measure branch coverage as well
+source = ['src']  # Limit coverage to the source code directory
+
+[tool.coverage.report]
+show_missing = true  # Show missing lines
+skip_covered = false  # Skip files with 100% coverage in the report
+fail_under = 0  # Minimum coverage percentage to pass
+
+##########################
+# Configuration for pytest
+##########################
+
+# 'pytest' -- Testing framework
+# https://docs.pytest.org/en/stable/
+
+[tool.pytest.ini_options]
+addopts = '--import-mode=importlib'
+testpaths = ['tests']
+
+########################
+# Configuration for ruff
+########################
+
+# 'ruff' -- Python linter and code formatter
+# https://docs.astral.sh/ruff/rules/
+
+[tool.ruff]
+indent-width = 4
+line-length = 99  # See also `max-line-length` in [tool.ruff.lint.pycodestyle]
+preview = true  # Enable new rules that are not yet stable, like DOC
+
+[tool.ruff.format]
+docstring-code-format = true  # Whether to format code snippets in docstrings
+docstring-code-line-length = 72  # Line length for code snippets in docstrings
+indent-style = 'space'  # PEP 8 recommends using spaces over tabs
+line-ending = 'lf'  # Line endings will be converted to \n
+quote-style = 'single'  # But double quotes in docstrings (PEP 8, PEP 257)
+
+[tool.ruff.lint]
+select = [
+  'F',  # https://docs.astral.sh/ruff/rules/#pyflakes-f
+  'I',  # https://docs.astral.sh/ruff/rules/#isort-i
+  'E',  # https://docs.astral.sh/ruff/rules/#error-e
+  'W',  # https://docs.astral.sh/ruff/rules/#warning-w
+  'S',  # https://docs.astral.sh/ruff/rules/#flake8-bandit-s
+]
+ignore = [
+  'COM812',  # https://docs.astral.sh/ruff/rules/missing-trailing-comma/
+  'DOC',  # Replaced by [tool.pydoclint]
+]
+
+[tool.ruff.lint.per-file-ignores]
+'*/__init__.py' = [
+  'F401',  # re-exports are intentional in __init__.py
+]
+'tests/**' = [
+  'S101',  # https://docs.astral.sh/ruff/rules/assert/
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = 'all'  # Disallow all relative imports
+
+[tool.ruff.lint.isort]
+force-single-line = true  # Forces all from imports to appear on their own line
+
+[tool.ruff.lint.pycodestyle]
+# Use 99 characters for regular code lines and 72 for docstrings.
+max-line-length = 99  # See also `line-length` in [tool.ruff]
+max-doc-length = 72
+
+[tool.ruff.lint.pydocstyle]
+convention = 'numpy'
+
+#############################
+# Configuration for pydoclint
+#############################
+
+# 'pydoclint' -- Docstring linter
+# https://pypi.org/project/pydoclint/
+
+[tool.pydoclint]
+style = 'numpy'
+check-style-mismatch = true
+check-arg-defaults = true
+allow-init-docstring = true

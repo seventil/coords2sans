@@ -1,0 +1,116 @@
+###########
+# WORKSPACE
+###########
+
+[workspace]
+# Supported platforms for the lock file (pixi.lock)
+platforms = [
+  'win-64',
+  { platform = 'linux-64', glibc = '2.35' },
+  { platform = 'osx-arm64', macos = '14.0' },
+]
+
+# Channels for fetching packages
+channels = ['nodefaults', 'conda-forge']
+
+##########
+# FEATURES
+##########
+
+# Default features:
+
+[activation.env]
+PYTHONIOENCODING = 'utf-8'
+
+# Ensures the package is used from the source code during development,
+# even if it is installed in editable mode via uv. This is important
+# because `pixi update` might replace the installed version with the
+# latest released version.
+
+# Unix/macOS
+[target.unix.activation.env]
+PYTHONPATH = '${PIXI_PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}'
+
+# Windows
+[target.win.activation.env]
+PYTHONPATH = '${PIXI_PROJECT_ROOT}/src;%PYTHONPATH%'
+
+# Non-default features:
+
+# Set specific Python versions to be used in CI testing.
+
+[feature.py-min.dependencies]
+python = '3.11.*'
+
+[feature.py-max.dependencies]
+python = '3.13.*'
+
+# Development dependencies for local development and testing with an
+# editable installation.
+
+[feature.dev.pypi-dependencies]
+coords2sans = { path = '.', editable = true, extras = ['dev', 'plot'] }
+
+##############
+# ENVIRONMENTS
+##############
+
+[environments]
+# The `default` environment is developer-oriented for local development
+# and testing with an editable installation of the current package.
+default = { features = ['py-max', 'dev'] }
+# The oldest supported Python, for checking compatibility.
+py-min = { features = ['py-min', 'dev'] }
+
+#######
+# TASKS
+#######
+
+[tasks]
+##################
+# 🧪 Testing Tasks
+##################
+
+unit-tests = 'python -m pytest tests/unit/ --color=yes -v'
+
+test = { depends-on = ['unit-tests'] }
+
+###########
+# ✔️ Checks
+###########
+
+pyproject-check = 'python -m validate_pyproject pyproject.toml'
+docstring-lint-check = 'pydoclint --quiet src/'
+py-lint-check = 'ruff check src/ tests/'
+py-format-check = 'ruff format --check src/ tests/'
+
+check = { depends-on = [
+  'pyproject-check',
+  'docstring-lint-check',
+  'py-lint-check',
+  'py-format-check',
+] }
+
+##########
+# 🛠️ Fixes
+##########
+
+py-lint-fix = 'ruff check --fix src/ tests/'
+py-format-fix = 'ruff format src/ tests/'
+success-message = 'echo "✅ All auto-formatting steps completed successfully!"'
+
+fix = { depends-on = ['py-format-fix', 'py-lint-fix', 'success-message'] }
+
+#############
+# 📊 Coverage
+#############
+
+unit-tests-coverage = 'pixi run unit-tests --cov=src/coords2sans --cov-report=term-missing'
+
+########################
+# 📦 Build Tasks
+########################
+
+dist-build = 'python -m build --wheel --outdir dist'
+
+clean-pycache = "find . -type d -name '__pycache__' -prune -exec rm -rf '{}' +"
