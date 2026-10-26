@@ -4,8 +4,8 @@ A toolkit to calculate small-angle neutron scattering (SANS) curves I(q) from at
 coordinates: for example a micelle or a vesicle from a molecular dynamics (MD)
 simulation.
 
-> **Status: design.** This README describes the planned package. The classes are not
-> written yet; `src/coords2sans/` holds the module layout only.
+> **Status: first version.** The four classes are written and tested. Two notebooks in
+> `examples/` show how to use them and compare them with SasView and sasmodels.
 
 - **Light:** depends only on numpy and periodictable. matplotlib is optional, for
   plotting. No SasView, no MD framework.
@@ -15,6 +15,8 @@ simulation.
   split back together.
 - **Object-oriented and small:** four classes. A whole calculation can be sent to
   another process as one picklable object.
+- **Checked against SasView and sasmodels:** one size equals SasView's `GenSAS`, and a
+  spread of sizes equals the `sphere` model of sasmodels (`examples/compare.ipynb`).
 
 It grew out of a SasView-based script used by our users, `SasCalc_polyJD.py`; the last
 section compares the two.
@@ -36,12 +38,15 @@ The diagrams are Mermaid; GitHub renders them.
 
 ## 1. Development setup
 
-The environment is managed with [pixi](https://pixi.sh). It installs Python and the
-package in editable mode, with the `dev` and `plot` extras.
+The environment is managed with [pixi](https://pixi.sh). It installs Python, JupyterLab
+and the package in editable mode, with the `dev` and `plot` extras.
 
 ```bash
 pixi install            # create the environment (default: Python 3.13)
 pixi run test           # unit tests
+pixi run notebook-tests # run the notebooks in examples/; compare.ipynb downloads two
+                        # SasView files on its first run
+pixi run jupyter lab    # open the notebooks
 pixi run check          # pyproject, docstring, lint and format checks
 pixi run fix            # auto-format and fix lint
 pixi run unit-tests-coverage
@@ -76,13 +81,17 @@ coords2sans/
     structure.py            # Structure
     calculator.py           # SansCalculator, SansTask
     curve.py                # Curve
-  tests/unit/
+  tests/unit/               # one test file per module
+  examples/
+    usage.ipynb             # one curve blocking, many curves in worker processes
+    compare.ipynb           # against SasView GenSAS, sasmodels and the polyJD script
+    data/                   # a CTAB micelle (CTA only) after equilibration stages 0 and 5
 ```
 
 | Class | Holds (attributes) | Does (methods) |
 |---|---|---|
 | `Structure` | the aggregate's atoms: residue numbers and names, atom names, positions in Å, elements, and where each residue's elements came from. The element table (H to U, and D), the mass tolerance and SasView's Avogadro number are class attributes | `read` prepares everything; then it gives the bounding-box `centre`, each atom's `volume`, and `sld(deuterated)` |
-| `SansCalculator` | the settings, as plain values: solvent SLD, deuterated residues, q range, scale, background, `polydispersity`, `size_points` | gives the q values and the sizes; computes one size (`form`) and the whole curve (`calculate`) |
+| `SansCalculator` | the settings, as plain values: solvent SLD, deuterated residues, q range, scale, background, `polydispersity`, `size_points` | gives the q values (`q`) and the curve (`calculate`). Private steps: the sizes and their shares (`_sizes`), one size's amplitude (`_form`) |
 | `Curve` | q, I and a label | writes and reads a SasView-readable `.dat`; plots |
 | `SansTask` | a structure file, how to read it, and a `SansCalculator` | `run()`: from the file to a `Curve`; plain picklable data, so it runs in another process |
 
@@ -102,10 +111,10 @@ classDiagram
         +ndarray elements
         +dict element_sources
         +read(path, residues, masses, elements) Structure$
-        -_from_gro(path, residues)$
-        -_from_pdb(path, residues)$
-        -_fix_periodic_wrapping(box)
-        -_assign_elements(masses, elements, pdb_elements)
+        -_from_gro(path) tuple$
+        -_from_pdb(path) tuple$
+        -_fix_periodic_wrapping(resids, positions, box) ndarray$
+        -_assign_elements(resids, resnames, names, masses, elements, file_elements) tuple$
         +centre ndarray
         +volume ndarray
         +sld(deuterated) ndarray
@@ -114,7 +123,7 @@ classDiagram
     class SansCalculator {
         +float SIZE_RANGE$ = 3
         +float solvent_sld
-        +list~str~ deuterated
+        +tuple~str~ deuterated
         +float q_min = 0.002
         +float q_max = 0.2
         +int q_points = 256
@@ -124,9 +133,9 @@ classDiagram
         +float polydispersity = 0.0
         +int size_points = 35
         +q ndarray
-        +sizes() tuple
-        +form(structure, factor) ndarray
         +calculate(structure, label) Curve
+        -_sizes() tuple
+        -_form(q, distances, amplitudes) ndarray$
     }
 
     class Curve {
@@ -140,10 +149,10 @@ classDiagram
 
     class SansTask {
         +Path structure_file
+        +SansCalculator calculator
         +list~str~ residues
         +dict masses
         +dict elements
-        +SansCalculator calculator
         +str label
         +run() Curve
     }
@@ -163,11 +172,12 @@ Read once, prepared once:
 structure = Structure.read(path, residues=None, masses=None, elements=None)
 ```
 
-`read` is the only public step. Inside it, three private steps run in this order:
+`read` is the only public step. Inside it, these steps run in this order:
 
 | Step | Method | What it does | Why |
 |---|---|---|---|
-| parse | `_from_gro` / `_from_pdb` | reads the fixed columns of the atoms whose residue is in `residues` (all if None); positions in Å | water and ions are the solvent, a constant SLD: their atoms are never used, so they are never kept |
+| parse | `_from_gro` / `_from_pdb` | reads the fixed columns of every atom; positions in Å | the file's suffix picks the reader |
+| keep the aggregate | `read` itself | keeps the atoms whose residue is in `residues` (all if None) | water and ions are the solvent, a constant SLD: their atoms are never used, so they are not kept |
 | fix wrapping | `_fix_periodic_wrapping` | `.gro` only: makes each molecule whole, finds the aggregate's centre with a mean that works across the box faces, and moves whole molecules next to it | 4.1 |
 | elements | `_assign_elements` | gives each atom its chemical element (C, H, N, O, P, D, Br …) | the neutron SLD and the atom volume are properties of the element; 4.2 |
 
@@ -272,17 +282,20 @@ The settings are plain values of its `__init__`:
 | `polydispersity` | 0.0 | the spread of sizes; 0 is one size (section 6) |
 | `size_points` | 35 | how many sizes stand in for the spread (section 6) |
 
-- `form(structure, factor)` is one size: positions × factor, volumes × factor³, and
-  F = Σ Δρ·V·sinc(q r) around the bounding-box centre, with
-  Δρ = `structure.sld(deuterated)` − `solvent_sld`.
-- `sizes()` gives the size factors and their shares (section 6).
-- `calculate(structure)` adds the sizes up and returns a `Curve`:
+- `q` gives the q values from `q_min`, `q_max`, `q_points` and `q_log`.
+- `calculate(structure, label)` returns a `Curve`. It works out once each atom's
+  distance r from the bounding-box centre and its amplitude Δρ·V, with
+  Δρ = `structure.sld(deuterated)` − `solvent_sld`. Then, for each size factor f from
+  the private `_sizes()` (section 6), the private `_form` computes one size:
+  F = Σ Δρ·V·f³·sinc(q r f). The sizes are added up as:
 
   ```
   I(q) = scale · Σ n·F(q)² / Σ n·V · 1e8 + background      (1e8: Å⁻¹ to cm⁻¹)
   ```
 
   With one size this is exactly `GenSAS`.
+- The settings are plain attributes: change one and call `calculate` again. That is why
+  `calculate`, not `__init__`, checks `polydispersity` and `size_points`.
 
 ## 6. Polydispersity
 
@@ -325,7 +338,7 @@ of this size        (the smooth curve: the sample, set by polydispersity)
 | `polydispersity` | the sample: how broad its size curve is | you, from what you know about the sample |
 | `size_points` | the calculation: how many sizes stand in for the curve | you, for accuracy against time |
 | size range ±3σ | which part of the curve is computed | fixed (`SansCalculator.SIZE_RANGE`) |
-| the picked sizes and their shares | evenly spaced over the range; the curve's height there | calculated by `sizes()` |
+| the picked sizes and their shares | evenly spaced over the range; the curve's height there | calculated by the private `_sizes()` |
 
 **Choosing the two knobs:**
 
@@ -337,8 +350,9 @@ of this size        (the smooth curve: the sample, set by polydispersity)
   - Above about 0.3 a Gaussian fits poorly: sizes ≤ 0 appear, and they are dropped.
   - Effects on the curve: the minima fill in, high-q oscillations damp out, and I(0)
     rises by ⟨V²⟩/⟨V⟩ (1.12× at 0.1, 3.0× at 0.4).
-- **`size_points`:** each size costs one full calculation (about 0.065 s for an
-  11,000-atom micelle, 2.7 s for a 400,000-atom vesicle). Too few show up as wiggles.
+- **`size_points`:** each size costs one full calculation (about 0.2 s for the
+  11,000-atom CTAB micelle at 256 q values; the time grows with atoms × q values). Too
+  few show up as wiggles.
   - Double it; if the curve stays the same, the lower value is enough. 20 to 50 is
     typical.
   - An odd number puts one size exactly at 1.
@@ -373,6 +387,9 @@ whole job is one picklable object:
 
 ## 8. Usage
 
+Both examples run from the repository root, on the data in `examples/data/`.
+`examples/usage.ipynb` runs them step by step, with plots.
+
 ### 8.1 Blocking: one curve
 
 ```python
@@ -384,8 +401,13 @@ from coords2sans import SansCalculator, Structure
 # with the CTA tails hydrogenated. The sample's micelles differ in size by about 10 %,
 # and the curve is written for SasView.
 
+# CTA's 62 atom masses in u, in the order of CTA.itp: N1, three methyl groups,
+# 15 CH2 groups and one end methyl
+N, C, H = 14.007, 12.011, 1.008
+cta_masses = [N] + [C, H, H, H] * 3 + [C, H, H] * 15 + [C, H, H, H]
+
 # any .gro or .pdb: a sample model, an equilibration stage, a frame from any MD program
-structure_file = Path("CTA178-BRA178-wTIP3-eq5.gro")
+structure_file = Path("examples/data/CTA178-eq5.gro")
 # residue names of the aggregate: one surfactant up to every lipid of a mixed vesicle;
 # all other residues (water, ions) are left out as solvent; None keeps every residue
 aggregate_residues = ["CTA"]
@@ -402,9 +424,9 @@ q_min, q_max, q_points = 0.002, 0.2, 256
 # q spacing: True (log, for log-log plots and wide ranges) or False (linear)
 q_log = True
 # volume fraction of the aggregates: above 0, up to 1; dilute samples about 0.001 to 0.05
-scale = 1.0
+scale = 0.01
 # flat background in cm⁻¹: 0 (none) up to about 1 for H2O-rich samples, about 0.05 in D2O
-background = 0.0
+background = 0.05
 # spread of micelle sizes (section 6): 0 (one size) to about 0.3;
 # well-defined micelles about 0.05 to 0.15
 polydispersity = 0.1
@@ -439,12 +461,12 @@ from pathlib import Path
 
 from coords2sans import SansCalculator, SansTask
 
-# Example setup: the same CTAB micelle at every equilibration stage, 0 to 5, each in
-# H2O and in D2O: 12 curves computed side by side, one size each, to see how the
-# micelle's curve changes while it equilibrates.
+# Example setup: the same CTAB micelle after the first and the last equilibration
+# stage, each in H2O and in D2O: 4 curves computed side by side, one size each, to see
+# how the micelle's curve changes while it equilibrates.
 
 # structure files to compute: one file up to every stage or trajectory frame
-stage_files = [Path(f"CTA178-BRA178-wTIP3-eq{stage}.gro") for stage in range(6)]
+stage_files = [Path(f"examples/data/CTA178-eq{stage}.gro") for stage in (0, 5)]
 # residue names of the aggregate, as in 8.1
 aggregate_residues = ["CTA"]
 # atom masses per residue, as in 8.1
@@ -458,18 +480,21 @@ workers = 4
 tasks = [
     SansTask(
         structure_file=stage_file,
+        calculator=SansCalculator(solvent_sld),
         residues=aggregate_residues,
         masses=residue_masses,
-        calculator=SansCalculator(solvent_sld),
         label=f"{stage_file.stem} in {contrast}",
     )
     for stage_file in stage_files
     for contrast, solvent_sld in contrasts.items()
 ]
-with ProcessPoolExecutor(max_workers=workers) as pool:
-    curves = list(pool.map(SansTask.run, tasks))
-for curve in curves:
-    curve.save(Path(f"{curve.label}.dat"))
+# On Windows and macOS, workers start fresh ("spawn") and import this file again;
+# the guard keeps them from starting their own pools. A notebook needs no guard.
+if __name__ == "__main__":
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        curves = list(pool.map(SansTask.run, tasks))
+    for curve in curves:
+        curve.save(Path(f"{curve.label}.dat"))
 ```
 
 ## 9. Workflow
@@ -492,15 +517,15 @@ flowchart TD
     end
 
     subgraph TASK["8.2 another process"]
-        T1["SansTask(structure_file, residues, masses, calculator)"]
+        T1["SansTask(structure_file, calculator, residues, masses)"]
         T2["pool.map(SansTask.run, tasks)"]
         T3["task.run(): Structure.read, then calculator.calculate, in the child"]
     end
 
     subgraph CALC["inside SansCalculator.calculate"]
-        C1["Δρ = structure.sld(deuterated) − solvent_sld · structure.volume"]
-        C2["sizes(): factors and shares n"]
-        C3["for each size: form(structure, factor)<br/>F = Σ Δρ·V·sinc(q r) around structure.centre"]
+        C1["r: each atom's distance from structure.centre<br/>Δρ·V = (structure.sld(deuterated) − solvent_sld) · structure.volume"]
+        C2["_sizes(): factors f and shares n"]
+        C3["for each size: _form(q, r·f, Δρ·V·f³)<br/>F = Σ Δρ·V·f³·sinc(q r f)"]
         C4["Curve(q, scale · Σ n·F² / Σ n·V · 1e8 + background)"]
     end
 
@@ -633,11 +658,11 @@ What the script hides:
 | elements | inside `PDBReader.read`, from the name's alignment | `_assign_elements`, inside `read`: masses, elements, PDB column, guess; `element_sources` |
 | deuteration | — (D written into the PDB) | `SansCalculator(deuterated=…)` → `structure.sld(deuterated)` |
 | SLD and volume | inside `PDBReader.read` (`nsf.neutron_sld`, `formula`) | `structure.sld(deuterated)`, `structure.volume`; the same formulas and Avogadro number |
-| keep the originals | `pos_xMASTER` … `vol_MASTER` | — (sizes are scaled inside `form`; the structure is never changed) |
+| keep the originals | `pos_xMASTER` … `vol_MASTER` | — (sizes are scaled inside `calculate`; the structure is never changed) |
 | q grid | `np.logspace(...)` | `calculator.q` from `q_min`, `q_max`, `q_points`, `q_log` |
 | model set-up | `GenSAS()`, `params[...]`, `set_sld_data`, `is_avg` | `SansCalculator(solvent_sld, deuterated=…, scale=…, background=…)` |
-| sizes | quantile sizes plus tent weights (`i`, `m` stepped by hand, `norm.ppf`); always on | `calculator.sizes()`: Gaussian, even sizes over ±3σ, normalised shares; off at `polydispersity = 0` |
-| one curve | `run` / `runXY` → `calculate_Iq` → `transform_center` → `geni.Iq` → `_calc_Iq_avg` | `calculator.form(structure, factor)`, with `structure.centre` |
+| sizes | quantile sizes plus tent weights (`i`, `m` stepped by hand, `norm.ppf`); always on | `_sizes()`, inside `calculate`: Gaussian, even sizes over ±3σ, normalised shares; off at `polydispersity = 0` |
+| one curve | `run` / `runXY` → `calculate_Iq` → `transform_center` → `geni.Iq` → `_calc_Iq_avg` | `_form(q, distances, amplitudes)`, inside `calculate`, with distances from `structure.centre` |
 | sum over sizes | `poly += runXY(...)`, 37 times: Σ w·F²/V, weights not normalised | `calculator.calculate(structure)`: Σ n·F² / Σ n·V |
 | file to curve in one call | the whole script, edited by hand | `SansTask(...).run()` |
 | write | `np.savetxt(dat, ..., delimiter=', ')` | `curve.save(path)`: the same two columns, plus a header |
@@ -667,4 +692,9 @@ keeps `scale` the volume fraction.
 | coords2sans | 0.390 (the ±3σ range trims the tails) | 3.0× |
 
 So curves from the script and from coords2sans can't be compared one to one: the
-script's are about 10× higher, and narrower than their written spread.
+script's are about 10× higher, and narrower than their written spread. With the script's
+real spread, 0.25, coords2sans gives 1.7× at the smallest q.
+
+`examples/compare.ipynb` runs these comparisons again: one size against `GenSAS` (they
+agree to about 1e-13), a spread of sizes against the `sphere` model of sasmodels (to
+about 4e-6), and the script's own loops on SasView against coords2sans.

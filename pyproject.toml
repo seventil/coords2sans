@@ -32,6 +32,8 @@ dev = [
   'build',  # Building the package
   'pytest',  # Testing
   'pytest-cov',  # Test coverage
+  'nbmake',  # Running the example notebooks as tests
+  'sasmodels',  # Reference curves in examples/compare.ipynb
   'ruff',  # Linting and formatting code
   'pydoclint',  # Docstring linter
   'validate-pyproject[all]',  # Validate pyproject.toml

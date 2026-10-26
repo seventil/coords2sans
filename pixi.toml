@@ -48,6 +48,9 @@ python = '3.13.*'
 # Development dependencies for local development and testing with an
 # editable installation.
 
+[feature.dev.dependencies]
+jupyterlab = '*'  # Jupyter notebooks in examples/
+
 [feature.dev.pypi-dependencies]
 coords2sans = { path = '.', editable = true, extras = ['dev', 'plot'] }
 
@@ -72,6 +75,7 @@ py-min = { features = ['py-min', 'dev'] }
 ##################
 
 unit-tests = 'python -m pytest tests/unit/ --color=yes -v'
+notebook-tests = 'python -m pytest --nbmake examples/ --nbmake-timeout=600 --color=yes -v'
 
 test = { depends-on = ['unit-tests'] }
 
@@ -81,8 +85,8 @@ test = { depends-on = ['unit-tests'] }
 
 pyproject-check = 'python -m validate_pyproject pyproject.toml'
 docstring-lint-check = 'pydoclint --quiet src/'
-py-lint-check = 'ruff check src/ tests/'
-py-format-check = 'ruff format --check src/ tests/'
+py-lint-check = 'ruff check src/ tests/ examples/'
+py-format-check = 'ruff format --check src/ tests/ examples/'
 
 check = { depends-on = [
   'pyproject-check',
@@ -95,8 +99,8 @@ check = { depends-on = [
 # 🛠️ Fixes
 ##########
 
-py-lint-fix = 'ruff check --fix src/ tests/'
-py-format-fix = 'ruff format src/ tests/'
+py-lint-fix = 'ruff check --fix src/ tests/ examples/'
+py-format-fix = 'ruff format src/ tests/ examples/'
 success-message = 'echo "✅ All auto-formatting steps completed successfully!"'
 
 fix = { depends-on = ['py-format-fix', 'py-lint-fix', 'success-message'] }
