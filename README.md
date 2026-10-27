@@ -9,14 +9,17 @@ simulation.
 
 - **Light:** depends only on numpy and periodictable. matplotlib is optional, for
   plotting. No SasView, no MD framework.
-- **The physics of SasView's `GenSAS`** with `is_avg = True`, the spherical average.
+- **Exact for any shape:** the Debye sum over all atom pairs, as SasView's `GenSAS`
+  computes it with `is_avg = False`. The pairs are first counted by distance, so an
+  11,000-atom micelle takes about 2 s. SasView's faster `is_avg = True` is a setting.
   Optionally it adds a Gaussian spread of sizes, combined as sasmodels does.
 - **Reads** GROMACS `.gro` and `.pdb` files, and puts aggregates that the periodic box
   split back together.
 - **Object-oriented and small:** four classes. A whole calculation can be sent to
   another process as one picklable object.
-- **Checked against SasView and sasmodels:** one size equals SasView's `GenSAS`, and a
-  spread of sizes equals the `sphere` model of sasmodels (`examples/compare.ipynb`).
+- **Checked against SasView and sasmodels:** the exact average equals SasView's own pair
+  sum to 1e-4, `is_avg = True` equals `GenSAS` to 1e-13, and a spread of sizes equals
+  the `sphere` model of sasmodels (`examples/compare.ipynb`).
 
 It grew out of a SasView-based script used by our users, `SasCalc_polyJD.py`; the last
 section compares the two.
@@ -64,10 +67,10 @@ these conditions, and each is something the calculation takes for granted:
 | The sample has | The calculation covers it with |
 |---|---|
 | thousands of micelles, far apart and placed at random (dilute) | each micelle scatters on its own, so the sample is n × one micelle; `scale` is the volume fraction. No interference between micelles: the structure factor S(q) = 1 |
-| micelles pointing in random directions | the spherical average (`GenSAS` `is_avg`): the amplitude F = Σ Δρ·V·sinc(q r), with r measured from the micelle's centre. Exact for a spherically symmetric object, an approximation for rods and flat bilayers |
+| micelles pointing in random directions | the average over all directions: the Debye sum over all atom pairs, Σ Δρ·V·Δρ·V·sinc(q r), with r the distance of the pair. Exact for any shape (section 5.1) |
 | micelles of different sizes | the size distribution (section 6) |
 | micelles of different shapes at any instant | one MD frame; averaging over frames comes later |
-| solvent, and incoherent scattering | a constant solvent SLD; each atom displaces solvent of its own volume (Δρ = its SLD − the solvent's); a flat `background` |
+| solvent, and incoherent scattering | a constant solvent SLD; each atom displaces solvent of its own volume (Δρ = its SLD − the solvent's); a flat `background`. The atom volumes come from the elements' bulk densities, as in SasView. For CTA they add up to 1194 Å³, against about 560 Å³ for the real molecule, so the contrast is off: I(0) is about 2× too high in D2O and 10× in H2O. Not corrected yet |
 | an instrument with finite resolution | not covered |
 
 ## 3. Layout
@@ -91,7 +94,7 @@ coords2sans/
 | Class | Holds (attributes) | Does (methods) |
 |---|---|---|
 | `Structure` | the aggregate's atoms: residue numbers and names, atom names, positions in Å, elements, and where each residue's elements came from. The element table (H to U, and D), the mass tolerance and SasView's Avogadro number are class attributes | `read` prepares everything; then it gives the bounding-box `centre`, each atom's `volume`, and `sld(deuterated)` |
-| `SansCalculator` | the settings, as plain values: solvent SLD, deuterated residues, q range, scale, background, `polydispersity`, `size_points` | gives the q values (`q`) and the curve (`calculate`). Private steps: the sizes and their shares (`_sizes`), one size's amplitude (`_form`) |
+| `SansCalculator` | the settings, as plain values: solvent SLD, deuterated residues, q range, scale, background, `polydispersity`, `size_points`, `average_amplitude`. The size range and the step of the pair distances (`BIN_WIDTH`) are class attributes | gives the q values (`q`) and the curve (`calculate`). Private steps: the sizes and their shares (`_sizes`), all atom pairs counted by distance (`_pair_histogram`), and Σ w·sinc(q r) (`_sinc_sum`) |
 | `Curve` | q, I and a label | writes and reads a SasView-readable `.dat`; plots |
 | `SansTask` | a structure file, how to read it, and a `SansCalculator` | `run()`: from the file to a `Curve`; plain picklable data, so it runs in another process |
 
@@ -122,6 +125,7 @@ classDiagram
 
     class SansCalculator {
         +float SIZE_RANGE$ = 3
+        +float BIN_WIDTH$ = 0.01
         +float solvent_sld
         +tuple~str~ deuterated
         +float q_min = 0.002
@@ -132,10 +136,12 @@ classDiagram
         +float background = 0.0
         +float polydispersity = 0.0
         +int size_points = 35
+        +bool average_amplitude = False
         +q ndarray
         +calculate(structure, label) Curve
         -_sizes() tuple
-        -_form(q, distances, amplitudes) ndarray$
+        -_pair_histogram(positions, amplitudes) tuple$
+        -_sinc_sum(q, distances, weights) ndarray$
     }
 
     class Curve {
@@ -281,21 +287,61 @@ The settings are plain values of its `__init__`:
 | `background` | 0.0 | a flat background in cm⁻¹ |
 | `polydispersity` | 0.0 | the spread of sizes; 0 is one size (section 6) |
 | `size_points` | 35 | how many sizes stand in for the spread (section 6) |
+| `average_amplitude` | False | square the amplitude averaged over the directions (SasView's `is_avg`), instead of the exact average (section 5.1) |
 
 - `q` gives the q values from `q_min`, `q_max`, `q_points` and `q_log`.
 - `calculate(structure, label)` returns a `Curve`. It works out once each atom's
-  distance r from the bounding-box centre and its amplitude Δρ·V, with
-  Δρ = `structure.sld(deuterated)` − `solvent_sld`. Then, for each size factor f from
-  the private `_sizes()` (section 6), the private `_form` computes one size:
-  F = Σ Δρ·V·f³·sinc(q r f). The sizes are added up as:
+  amplitude Δρ·V, with Δρ = `structure.sld(deuterated)` − `solvent_sld`, and the size
+  factors f with their shares n from the private `_sizes()` (section 6). Then one size,
+  I₁(q):
+  - **by default, the exact average:** the private `_pair_histogram` adds Δρ·V·Δρ·V of
+    every atom pair at the pair's distance, rounded to `BIN_WIDTH` (0.01 Å). Then
+    I₁(q) = Σ histogram · sinc(q r) over the bins (the private `_sinc_sum`).
+  - **with `average_amplitude`:** F(q) = Σ Δρ·V·sinc(q r), with r each atom's distance
+    from the bounding-box centre, and I₁ = F².
+
+  A size f stretches every distance by f and every amplitude by f³, so it gives
+  f⁶·I₁(f q). The histogram is made once, for all sizes. The sizes are added up as:
 
   ```
-  I(q) = scale · Σ n·F(q)² / Σ n·V · 1e8 + background      (1e8: Å⁻¹ to cm⁻¹)
+  I(q) = scale · Σ n·f⁶·I₁(f q) / Σ n·V·f³ · 1e8 + background      (1e8: Å⁻¹ to cm⁻¹)
   ```
 
-  With one size this is exactly `GenSAS`.
+  With one size, the default is exactly `GenSAS` with `is_avg = False`, and
+  `average_amplitude = True` is exactly `GenSAS` with `is_avg = True`.
 - The settings are plain attributes: change one and call `calculate` again. That is why
   `calculate`, not `__init__`, checks `polydispersity` and `size_points`.
+
+### 5.1 The exact average and the averaged amplitude
+
+A sample holds micelles pointing in every direction, so the curve is an average over
+the directions. There are two ways to compute it:
+
+| | Exact average (default) | Averaged amplitude (`average_amplitude = True`) |
+|---|---|---|
+| What it averages | the intensity: Debye's sum over all atom pairs | the amplitude, which it then squares |
+| Right for | any shape | round objects only: spheres, round vesicles |
+| In SasView | `GenSAS` with `is_avg = False` | `GenSAS` with `is_avg = True`; the polyJD script |
+| Time for the CTAB micelle (11,000 atoms, 256 q values) | 2.3 s for one size, 4.6 s for 35 sizes | 0.07 s, 1.9 s |
+| Time grows with | atoms² (about 6 min for 130,000 atoms) | atoms |
+
+The CTAB micelle in `examples/data` is a short rod, about 99 × 64 × 56 Å. For it the
+averaged amplitude is right only at low q:
+
+| q (Å⁻¹) | 0.02 | 0.04 | 0.06 | 0.095 | 0.144 |
+|---|---|---|---|---|---|
+| averaged amplitude / exact | 0.999 | 0.991 | 0.953 | 0.647 | 0.009 |
+
+So for rod-like micelles, curves from the polyJD script are too low above
+q ≈ 0.05 Å⁻¹, with a deep minimum that the micelle does not have.
+
+**Why the exact average is fast.** Summing every pair at every q takes about 45 s per
+curve for this micelle (SasView's plain sum, at 32 q values). coords2sans visits each
+pair once and adds its Δρ·V·Δρ·V to a bin at its distance, in steps of `BIN_WIDTH`
+(0.01 Å). Each q is then a sum over about 13,000 bins instead of 60 million pairs, and
+all sizes of a spread use the same bins. Rounding the distances changes the curve by
+about 1e-4 (`examples/compare.ipynb`). The AUSAXS library, which `GenSAS` uses when it
+is installed, also counts pairs by distance.
 
 ## 6. Polydispersity
 
@@ -350,9 +396,9 @@ of this size        (the smooth curve: the sample, set by polydispersity)
   - Above about 0.3 a Gaussian fits poorly: sizes ≤ 0 appear, and they are dropped.
   - Effects on the curve: the minima fill in, high-q oscillations damp out, and I(0)
     rises by ⟨V²⟩/⟨V⟩ (1.12× at 0.1, 3.0× at 0.4).
-- **`size_points`:** each size costs one full calculation (about 0.2 s for the
-  11,000-atom CTAB micelle at 256 q values; the time grows with atoms × q values). Too
-  few show up as wiggles.
+- **`size_points`:** each size costs one sum over the distance bins (about 0.07 s for
+  the 11,000-atom CTAB micelle at 256 q values), after one pass over all atom pairs that
+  every size shares (about 2 s). Too few show up as wiggles.
   - Double it; if the curve stays the same, the lower value is enough. 20 to 50 is
     typical.
   - An odd number puts one size exactly at 1.
@@ -431,8 +477,11 @@ background = 0.05
 # well-defined micelles about 0.05 to 0.15
 polydispersity = 0.1
 # sizes computed to stand in for the spread (section 6): about 20 to 50; double it, and
-# keep it if the curve stays the same; each size costs one full calculation
+# keep it if the curve stays the same
 size_points = 35
+# averaging over the directions (section 5.1): False (exact, over all atom pairs) or
+# True (SasView's is_avg: much faster above 100,000 atoms, right only for round ones)
+average_amplitude = False
 
 structure = Structure.read(structure_file, residues=aggregate_residues, masses=residue_masses)
 print(structure.element_sources)  # {"CTA": "masses"}: check before trusting a guess
@@ -447,6 +496,7 @@ calculator = SansCalculator(
     background=background,
     polydispersity=polydispersity,
     size_points=size_points,
+    average_amplitude=average_amplitude,
 )
 curve = calculator.calculate(structure, label="eq5 in D2O")
 curve.save(Path("eq5-D2O.dat"))
@@ -512,7 +562,7 @@ flowchart TD
     end
 
     subgraph BLOCKING["8.1 blocking"]
-        B1["SansCalculator(solvent_sld, deuterated, q range, scale, background,<br/>polydispersity = 0, size_points = 35)"]
+        B1["SansCalculator(solvent_sld, deuterated, q range, scale, background,<br/>polydispersity = 0, size_points = 35, average_amplitude = False)"]
         B2["calculator.calculate(structure)"]
     end
 
@@ -523,10 +573,12 @@ flowchart TD
     end
 
     subgraph CALC["inside SansCalculator.calculate"]
-        C1["r: each atom's distance from structure.centre<br/>Δρ·V = (structure.sld(deuterated) − solvent_sld) · structure.volume"]
+        C1["Δρ·V = (structure.sld(deuterated) − solvent_sld) · structure.volume"]
         C2["_sizes(): factors f and shares n"]
-        C3["for each size: _form(q, r·f, Δρ·V·f³)<br/>F = Σ Δρ·V·f³·sinc(q r f)"]
-        C4["Curve(q, scale · Σ n·F² / Σ n·V · 1e8 + background)"]
+        C3["default: _pair_histogram(positions, Δρ·V)<br/>each pair's Δρ·V·Δρ·V at its distance, in BIN_WIDTH steps"]
+        C3A["average_amplitude: r = each atom's distance from structure.centre"]
+        C4["for each size: I₁(f q) by _sinc_sum<br/>Σ histogram·sinc(f q r), or (Σ Δρ·V·sinc(f q r))²"]
+        C5["Curve(q, scale · Σ n·f⁶·I₁(f q) / Σ n·V·f³ · 1e8 + background)"]
     end
 
     R1 --> R2 --> R3 --> E1 --> B2
@@ -534,7 +586,10 @@ flowchart TD
     B1 --> B2
     T1 --> T2 --> T3
     T3 -.->|"same steps"| R1
-    B2 --> C1 --> C2 --> C3 --> C4
+    B2 --> C1 --> C2
+    C2 --> C3 --> C4
+    C2 --> C3A --> C4
+    C4 --> C5
 ```
 
 ## 10. Compared with SasCalc_polyJD.py and SasView
@@ -662,7 +717,7 @@ What the script hides:
 | q grid | `np.logspace(...)` | `calculator.q` from `q_min`, `q_max`, `q_points`, `q_log` |
 | model set-up | `GenSAS()`, `params[...]`, `set_sld_data`, `is_avg` | `SansCalculator(solvent_sld, deuterated=…, scale=…, background=…)` |
 | sizes | quantile sizes plus tent weights (`i`, `m` stepped by hand, `norm.ppf`); always on | `_sizes()`, inside `calculate`: Gaussian, even sizes over ±3σ, normalised shares; off at `polydispersity = 0` |
-| one curve | `run` / `runXY` → `calculate_Iq` → `transform_center` → `geni.Iq` → `_calc_Iq_avg` | `_form(q, distances, amplitudes)`, inside `calculate`, with distances from `structure.centre` |
+| one curve | `run` / `runXY` → `calculate_Iq` → `transform_center` → `geni.Iq` → `_calc_Iq_avg`: the averaged amplitude | inside `calculate`, by default the exact average: `_pair_histogram`, then `_sinc_sum`. With `average_amplitude = True`, as the script: `_sinc_sum` over the distances from `structure.centre`, squared |
 | sum over sizes | `poly += runXY(...)`, 37 times: Σ w·F²/V, weights not normalised | `calculator.calculate(structure)`: Σ n·F² / Σ n·V |
 | file to curve in one call | the whole script, edited by hand | `SansTask(...).run()` |
 | write | `np.savetxt(dat, ..., delimiter=', ')` | `curve.save(path)`: the same two columns, plus a header |
@@ -670,12 +725,17 @@ What the script hides:
 
 ### 10.3 What is the same, and what differs on purpose
 
-**The same:** one size is computed exactly as `GenSAS` with `is_avg = True` does it:
+**The same, with `average_amplitude = True`:** one size is computed exactly as `GenSAS`
+with `is_avg = True` does it:
 
 - the bounding-box centre;
 - the `sinc` sum and × 1e8 / Σ V;
 - SLD and volume from periodictable with SasView's Avogadro number;
 - `scale` and `background`.
+
+**Different on purpose: the average over the directions.** The script squares the
+averaged amplitude; by default coords2sans averages the intensity exactly (section 5.1).
+For a rod-like micelle the script's curves are too low above q ≈ 0.05 Å⁻¹.
 
 **Different on purpose: the spread of sizes.** The script places its sizes at Gaussian
 quantiles, which already makes them as common as the Gaussian says, and then weights them
@@ -695,6 +755,7 @@ So curves from the script and from coords2sans can't be compared one to one: the
 script's are about 10× higher, and narrower than their written spread. With the script's
 real spread, 0.25, coords2sans gives 1.7× at the smallest q.
 
-`examples/compare.ipynb` runs these comparisons again: one size against `GenSAS` (they
-agree to about 1e-13), a spread of sizes against the `sphere` model of sasmodels (to
+`examples/compare.ipynb` runs these comparisons again: the exact average against
+SasView's own pair sum (they agree to about 1e-4), the averaged amplitude against
+`GenSAS` (to about 1e-13), a spread of sizes against the `sphere` model of sasmodels (to
 about 4e-6), and the script's own loops on SasView against coords2sans.

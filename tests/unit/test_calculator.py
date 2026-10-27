@@ -34,28 +34,72 @@ class TestQ:
 
 
 class TestOneSize:
-    def test_forward_scattering(self):
+    @pytest.mark.parametrize('average_amplitude', [False, True])
+    def test_forward_scattering(self, average_amplitude):
         # At q = 0 every atom adds its full amplitude:
         # I(0) = scale (Σ Δρ V)² 1e8 / Σ V + background.
         volume = RANDOM_ATOMS.volume
         contrast = RANDOM_ATOMS.sld() + 0.56e-6
         expected = 2 * (contrast @ volume) ** 2 * 1e8 / volume.sum() + 0.1
         calculator = SansCalculator(
-            -0.56e-6, q_min=0, q_max=0, q_points=1, q_log=False, scale=2, background=0.1
+            -0.56e-6,
+            q_min=0,
+            q_max=0,
+            q_points=1,
+            q_log=False,
+            scale=2,
+            background=0.1,
+            average_amplitude=average_amplitude,
         )
 
         curve = calculator.calculate(RANDOM_ATOMS)
 
         assert curve.intensity == pytest.approx([expected], rel=1e-12)
 
-    def test_distances_from_the_bounding_box_middle(self):
+    @pytest.mark.parametrize('count', [3, 1500])
+    def test_debye_sum_over_all_pairs(self, count):
+        # Atoms 1 Å apart on a line: each pairs with itself at 0 Å,
+        # and there are 2 (count − d) pairs at d Å. 1500 atoms take
+        # three blocks of pairs.
+        positions = np.c_[np.arange(count), np.zeros((count, 2))]
+        carbons = ['C'] * count
+        structure = Structure(range(count), ['X'] * count, carbons, positions, carbons)
+        volume = CARBON.volume[0]
+        calculator = SansCalculator(SOLVENT_SLD, q_min=0.01, q_max=1, q_points=16)
+        q = calculator.q
+        d = np.arange(1, count)
+        pairs = count + 2 * (count - d) @ (np.sin(np.outer(d, q)) / np.outer(d, q))
+        expected = (CONTRAST * volume) ** 2 * pairs * 1e8 / (count * volume)
+
+        curve = calculator.calculate(structure)
+
+        np.testing.assert_allclose(curve.intensity, expected, rtol=1e-9)
+
+    def test_debye_distances_rounded_to_the_bin_width(self):
+        # The exact pair sum, without bins. With 100 atoms the rounding
+        # errors of the pairs cancel less than in a micelle: 1.4e-4.
+        amplitudes = (RANDOM_ATOMS.sld() + 0.56e-6) * RANDOM_ATOMS.volume
+        distances = np.linalg.norm(
+            RANDOM_ATOMS.positions[:, None] - RANDOM_ATOMS.positions, axis=-1
+        )
+        calculator = SansCalculator(-0.56e-6)
+        pairs = [amplitudes @ np.sinc(q * distances / np.pi) @ amplitudes for q in calculator.q]
+        expected = np.array(pairs) * 1e8 / RANDOM_ATOMS.volume.sum()
+
+        curve = calculator.calculate(RANDOM_ATOMS)
+
+        np.testing.assert_allclose(curve.intensity, expected, rtol=1e-3)
+
+    def test_average_amplitude_from_the_bounding_box_middle(self):
         # As SasView, distances count from the middle of the bounding
         # box, not from the mean position: atoms at x = 0, 1 and 10 Å
         # lie 5, 4 and 5 Å from x = 5 Å.
         positions = [[0.0, 0, 0], [1, 0, 0], [10, 0, 0]]
         structure = Structure([1, 2, 3], ['X'] * 3, ['C'] * 3, positions, ['C'] * 3)
         volume = CARBON.volume[0]
-        calculator = SansCalculator(SOLVENT_SLD, q_min=0.01, q_max=1, q_points=16)
+        calculator = SansCalculator(
+            SOLVENT_SLD, q_min=0.01, q_max=1, q_points=16, average_amplitude=True
+        )
         q = calculator.q
         form = CONTRAST * volume * (2 * np.sin(5 * q) / (5 * q) + np.sin(4 * q) / (4 * q))
 
@@ -63,11 +107,13 @@ class TestOneSize:
 
         np.testing.assert_allclose(curve.intensity, form**2 * 1e8 / (3 * volume), rtol=1e-12)
 
-    def test_uniform_sphere_matches_analytic_sphere(self):
+    def test_average_amplitude_of_uniform_sphere_matches_analytic_sphere(self):
         # The sphere of sasmodels' "sphere" model: I = Δρ² V P(qR)² 1e8.
         # Radii R u^(1/3) on a regular u grid fill it evenly; ± pairs
         # put the bounding-box middle at 0. R is set so that the
-        # carbons' volumes add up to the sphere's.
+        # carbons' volumes add up to the sphere's. The averaged
+        # amplitude sees only the radii; the Debye sum would add each
+        # atom's pair with itself, which a smooth sphere does not have.
         count = 20000
         sphere_volume = 2 * count * CARBON.volume[0]
         radius = (3 * sphere_volume / (4 * np.pi)) ** (1 / 3)
@@ -77,7 +123,7 @@ class TestOneSize:
         positions = np.r_[radii[:, None] * directions, -radii[:, None] * directions]
         carbons = ['C'] * 2 * count
         sphere = Structure([1] * 2 * count, ['X'] * 2 * count, carbons, positions, carbons)
-        calculator = SansCalculator(SOLVENT_SLD, q_min=0.001, q_max=0.2)
+        calculator = SansCalculator(SOLVENT_SLD, q_min=0.001, q_max=0.2, average_amplitude=True)
         x = calculator.q * radius
         expected = (
             CONTRAST**2 * sphere_volume * (3 * (np.sin(x) - x * np.cos(x)) / x**3) ** 2 * 1e8
@@ -155,21 +201,35 @@ class TestSizes:
 
 
 class TestPolydispersity:
-    def test_sizes_scale_positions_and_volumes(self):
-        # Two carbons 2 Å from the middle. A size f moves them to 2 f Å
-        # and makes their volumes f³ as big:
-        # F = 2 Δρ V f³ sin(2 f q) / (2 f q). The shares n combine
-        # them: I = Σ n F² 1e8 / Σ n 2 V f³.
+    @pytest.mark.parametrize(
+        ('average_amplitude', 'one_size'),
+        [
+            # Debye: two self pairs, and the pair 4 Å apart both ways
+            (False, lambda x: 2 + 2 * np.sin(4 * x) / (4 * x)),
+            # (Σ sinc)²: each carbon 2 Å from the middle
+            (True, lambda x: (2 * np.sin(2 * x) / (2 * x)) ** 2),
+        ],
+    )
+    def test_sizes_scale_positions_and_volumes(self, average_amplitude, one_size):
+        # Two carbons 4 Å apart. A size f moves them to 4 f Å and makes
+        # their volumes f³ as big: I_f = (Δρ V f³)² one_size(f q). The
+        # shares n combine them: I = Σ n I_f 1e8 / Σ n 2 V f³.
         positions = [[-2.0, 0, 0], [2, 0, 0]]
         structure = Structure([1, 2], ['X'] * 2, ['C'] * 2, positions, ['C'] * 2)
         volume = CARBON.volume[0]
         calculator = SansCalculator(
-            SOLVENT_SLD, q_min=0.01, q_max=1, q_points=16, polydispersity=0.4, size_points=5
+            SOLVENT_SLD,
+            q_min=0.01,
+            q_max=1,
+            q_points=16,
+            polydispersity=0.4,
+            size_points=5,
+            average_amplitude=average_amplitude,
         )
         q = calculator.q
         factors, shares = calculator._sizes()
-        forms = [2 * CONTRAST * volume * f**3 * np.sin(2 * f * q) / (2 * f * q) for f in factors]
-        expected = np.dot(shares, np.square(forms)) * 1e8 / (shares @ (2 * volume * factors**3))
+        sizes = [(CONTRAST * volume * f**3) ** 2 * one_size(f * q) for f in factors]
+        expected = np.dot(shares, sizes) * 1e8 / (shares @ (2 * volume * factors**3))
 
         curve = calculator.calculate(structure)
 
